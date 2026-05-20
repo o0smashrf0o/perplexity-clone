@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
+import ollama
 import streamlit as st
 from agno.agent import Agent
 from agno.models.ollama import Ollama
@@ -40,6 +41,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("local_perplexity")
 
+
 DESCRIPTION = (
     "You are a local Perplexity-style assistant. "
     "You can search the web, crawl pages, inspect local files, run safe shell commands, "
@@ -62,16 +64,63 @@ def build_prompt(user_message: str) -> str:
     history = st.session_state.history
     if not history:
         return user_message
+
     lines: List[str] = []
     for i, turn in enumerate(history, start=1):
         lines.append(f"Turn {i} - User: {turn['user']}")
         lines.append(f"Turn {i} - Assistant: {turn['assistant']}")
+
     history_block = "\n".join(lines)
     return (
         "Use the recent conversation history below to answer the next user message.\n\n"
         f"Recent conversation history:\n{history_block}\n\n"
         f"Current user message:\n{user_message}\n"
     )
+
+
+@st.cache_data(ttl=10)
+def get_local_ollama_models() -> List[str]:
+    try:
+        resp = ollama.list()
+
+        if hasattr(resp, "models"):
+            raw_models = resp.models or []
+        elif isinstance(resp, dict):
+            raw_models = resp.get("models", [])
+        else:
+            raw_models = []
+
+        names: List[str] = []
+        for model in raw_models:
+            if hasattr(model, "model"):
+                name = model.model
+            elif isinstance(model, dict):
+                name = model.get("model") or model.get("name")
+            else:
+                name = None
+
+            if name:
+                names.append(name)
+
+        names = sorted(set(names))
+
+        embedding_like = {
+            "all-minilm:latest",
+            "nomic-embed-text:latest",
+        }
+
+        chat_models = [m for m in names if m not in embedding_like]
+        return chat_models or names
+
+    except Exception as exc:
+        log.warning("Could not load Ollama models: %s", exc)
+        return []
+
+
+def validate_model_id(model_id: str, available_models: List[str]) -> str:
+    if available_models and model_id not in available_models:
+        return available_models[0]
+    return model_id
 
 
 def make_searxng_tool(searxng_url: str, max_results: int):
@@ -91,6 +140,7 @@ def make_searxng_tool(searxng_url: str, max_results: int):
             results = resp.json().get("results", [])
             if not results:
                 return "No results found."
+
             lines: List[str] = []
             for r in results[:max_results]:
                 lines.append(
@@ -152,6 +202,7 @@ def python_runner(code: str) -> str:
     banned = ["import os", "import subprocess", "open(", "rm -rf", "sys.exit"]
     if any(b in code for b in banned):
         return "Refused: potentially unsafe Python code."
+
     try:
         result = subprocess.run(
             ["python", "-c", code],
@@ -189,7 +240,11 @@ def sanitize_output(text: str) -> str:
     cleaned = text.strip()
     if "<channel|>" in cleaned:
         cleaned = cleaned.split("<channel|>")[-1].strip()
-    phase_block = re.compile(r"^## PHASE\s+\d+.*?(?=^## PHASE\s+\d+|\Z)", re.MULTILINE | re.DOTALL)
+
+    phase_block = re.compile(
+        r"^## PHASE\s+\d+.*?(?=^## PHASE\s+\d+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
     cleaned = phase_block.sub("", cleaned).strip()
     return cleaned or text.strip()
 
@@ -203,6 +258,7 @@ def build_agent(cfg: Config) -> Agent:
         FileTools(),
         python_runner,
     ]
+
     return Agent(
         model=Ollama(id=cfg.model_id),
         tools=tools,
@@ -224,13 +280,42 @@ async def run_agent(user_text: str):
 def render_sidebar() -> None:
     st.sidebar.title("Settings")
     cfg = st.session_state.cfg
-    cfg.model_id = st.sidebar.text_input("Ollama model", value=cfg.model_id)
+
+    model_col, refresh_col = st.sidebar.columns([4, 1])
+
+    with refresh_col:
+        if st.button("↻", help="Refresh local Ollama models", use_container_width=True):
+            get_local_ollama_models.clear()
+            st.rerun()
+
+    available_models = get_local_ollama_models()
+    cfg.model_id = validate_model_id(cfg.model_id, available_models)
+
+    with model_col:
+        if available_models:
+            current_index = available_models.index(cfg.model_id)
+            cfg.model_id = st.selectbox(
+                "Ollama model",
+                options=available_models,
+                index=current_index,
+                help="Choose from models installed in your local Ollama instance.",
+            )
+        else:
+            cfg.model_id = st.text_input(
+                "Ollama model",
+                value=cfg.model_id,
+                help="Could not auto-load local models, so you can enter one manually.",
+            )
+
+    st.sidebar.caption(f"Using model: `{cfg.model_id}`")
+
     cfg.searxng_url = st.sidebar.text_input("SearXNG URL", value=cfg.searxng_url)
     cfg.max_search_results = st.sidebar.slider("Max search results", 1, 10, cfg.max_search_results)
     cfg.max_page_length = st.sidebar.slider("Max page length", 1000, 20000, cfg.max_page_length, step=500)
     cfg.crawl_timeout = st.sidebar.slider("Crawl timeout (s)", 5, 120, cfg.crawl_timeout)
     cfg.max_tool_calls = st.sidebar.slider("Max tool calls", 1, 50, cfg.max_tool_calls)
     cfg.max_history_turns = st.sidebar.slider("History turns", 1, 20, cfg.max_history_turns)
+
     st.session_state.history = deque(st.session_state.history, maxlen=cfg.max_history_turns)
 
     st.sidebar.divider()
@@ -274,10 +359,12 @@ def main() -> None:
                 resp = asyncio.run(run_agent(user_text))
                 answer = sanitize_output(resp.content or "")
                 placeholder.markdown(answer)
+
                 tools_used = [t.tool_name for t in getattr(resp, "tools", [])] if getattr(resp, "tools", None) else []
                 if tools_used:
                     with st.expander("Tools used"):
                         st.write(tools_used)
+
                 st.session_state.last_tools = tools_used
             except Exception as exc:
                 answer = f"Error from agent: {exc}"
