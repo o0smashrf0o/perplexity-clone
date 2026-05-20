@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-local_perplexity_cli.py — Simple single-file local Perplexity-style assistant.
-
-Features (all local):
-- Ollama LLM via Agno
-- Web search via SearXNG
-- Web crawling via Crawl4AI
-- File tools (read/write)
-- Shell tools (safe, read-only)
-- Tiny Python runner for calculations
-
-This is a minimal architecture prototype, not production code.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -23,9 +8,10 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 import httpx
+import streamlit as st
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 from agno.tools import tool
@@ -33,9 +19,7 @@ from agno.tools.crawl4ai import Crawl4aiTools
 from agno.tools.file import FileTools
 from agno.tools.shell import ShellTools
 
-# ---------------------------------------------------------------------
-# Config + logging
-# ---------------------------------------------------------------------
+
 @dataclass
 class Config:
     model_id: str = "gemma4:latest"
@@ -49,8 +33,6 @@ class Config:
     workspace_dir: Path = Path(".").resolve()
 
 
-CFG = Config()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -58,14 +40,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("local_perplexity")
 
+DESCRIPTION = (
+    "You are a local Perplexity-style assistant. "
+    "You can search the web, crawl pages, inspect local files, run safe shell commands, "
+    "and execute small Python snippets for calculations."
+)
 
-# ---------------------------------------------------------------------
-# Conversation history
-# ---------------------------------------------------------------------
-history: deque[Dict[str, str]] = deque(maxlen=CFG.max_history_turns)
+
+def init_state() -> None:
+    if "cfg" not in st.session_state:
+        st.session_state.cfg = Config()
+    if "history" not in st.session_state:
+        st.session_state.history = deque(maxlen=st.session_state.cfg.max_history_turns)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "last_tools" not in st.session_state:
+        st.session_state.last_tools = []
 
 
 def build_prompt(user_message: str) -> str:
+    history = st.session_state.history
     if not history:
         return user_message
     lines: List[str] = []
@@ -80,9 +74,6 @@ def build_prompt(user_message: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------
 def make_searxng_tool(searxng_url: str, max_results: int):
     @tool(
         name="searxng_search",
@@ -108,8 +99,8 @@ def make_searxng_tool(searxng_url: str, max_results: int):
                     f"Snippet: {r.get('content')}\n---"
                 )
             return "\n".join(lines)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("  search error: %s", exc)
+        except Exception as exc:
+            log.warning("search error: %s", exc)
             return f"Search error: {exc}"
 
     return searxng_search
@@ -135,17 +126,12 @@ def make_batch_crawl_tool(max_length: int, timeout: int):
         async def _fetch(url: str) -> tuple[str, str]:
             try:
                 async with AsyncWebCrawler(verbose=False) as crawler:
-                    result = await asyncio.wait_for(
-                        crawler.arun(url=url),
-                        timeout=timeout,
-                    )
-                    text = getattr(result, "markdown", None) or getattr(
-                        result, "extracted_content", ""
-                    ) or ""
+                    result = await asyncio.wait_for(crawler.arun(url=url), timeout=timeout)
+                    text = getattr(result, "markdown", None) or getattr(result, "extracted_content", "") or ""
                     return url, text[:max_length]
             except asyncio.TimeoutError:
                 return url, f"[Timeout after {timeout}s]"
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 return url, f"[Error: {exc}]"
 
         pairs = await asyncio.gather(*[_fetch(u) for u in url_list])
@@ -178,18 +164,8 @@ def python_runner(code: str) -> str:
         if err:
             return f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
         return out or "(no output)"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"Error running Python: {exc}"
-
-
-# ---------------------------------------------------------------------
-# Instructions + sanitization
-# ---------------------------------------------------------------------
-DESCRIPTION = (
-    "You are a local Perplexity-style assistant. "
-    "You can search the web, crawl pages, inspect local files, run safe shell commands, "
-    "and execute small Python snippets for calculations."
-)
 
 
 def build_instructions(cfg: Config) -> List[str]:
@@ -204,7 +180,6 @@ def build_instructions(cfg: Config) -> List[str]:
         "Use python_runner only for short calculations or simple analysis.",
         "When you use web content, always include inline citations like [Source](URL).",
         "Keep answers concise and in Markdown.",
-
         "First, briefly plan which tools you need.",
         "Then discover URLs if needed, crawl pages, and synthesize an answer with sources.",
     ]
@@ -214,17 +189,11 @@ def sanitize_output(text: str) -> str:
     cleaned = text.strip()
     if "<channel|>" in cleaned:
         cleaned = cleaned.split("<channel|>")[-1].strip()
-    phase_block = re.compile(
-        r"^## PHASE\s+\d+.*?(?=^## PHASE\s+\d+|\Z)",
-        re.MULTILINE | re.DOTALL,
-    )
+    phase_block = re.compile(r"^## PHASE\s+\d+.*?(?=^## PHASE\s+\d+|\Z)", re.MULTILINE | re.DOTALL)
     cleaned = phase_block.sub("", cleaned).strip()
     return cleaned or text.strip()
 
 
-# ---------------------------------------------------------------------
-# Build agent
-# ---------------------------------------------------------------------
 def build_agent(cfg: Config) -> Agent:
     tools: List[Any] = [
         make_searxng_tool(cfg.searxng_url, cfg.max_search_results),
@@ -234,7 +203,7 @@ def build_agent(cfg: Config) -> Agent:
         FileTools(),
         python_runner,
     ]
-    agent = Agent(
+    return Agent(
         model=Ollama(id=cfg.model_id),
         tools=tools,
         description=DESCRIPTION,
@@ -243,43 +212,80 @@ def build_agent(cfg: Config) -> Agent:
         debug_mode=True,
         markdown=True,
     )
-    log.info("Agent ready | model=%s | searxng=%s", cfg.model_id, cfg.searxng_url)
-    return agent
 
 
-# ---------------------------------------------------------------------
-# CLI chat loop (no API)
-# ---------------------------------------------------------------------
-async def chat_loop() -> None:
-    agent = build_agent(CFG)
-    print("Local Perplexity-style agent ready. Type 'exit' or 'quit' to stop.\n")
+async def run_agent(user_text: str):
+    cfg = st.session_state.cfg
+    prompt = build_prompt(user_text)
+    agent = build_agent(cfg)
+    return await agent.arun(prompt)
 
-    while True:
-        user = input("You: ").strip()
-        if not user:
-            continue
-        if user.lower() in {"exit", "quit"}:
-            print("Goodbye!")
-            break
 
-        prompt = build_prompt(user)
-        try:
-            resp = await agent.arun(prompt)
-            answer = sanitize_output(resp.content or "")
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Agent error")
-            answer = f"Error from agent: {exc}"
+def render_sidebar() -> None:
+    st.sidebar.title("Settings")
+    cfg = st.session_state.cfg
+    cfg.model_id = st.sidebar.text_input("Ollama model", value=cfg.model_id)
+    cfg.searxng_url = st.sidebar.text_input("SearXNG URL", value=cfg.searxng_url)
+    cfg.max_search_results = st.sidebar.slider("Max search results", 1, 10, cfg.max_search_results)
+    cfg.max_page_length = st.sidebar.slider("Max page length", 1000, 20000, cfg.max_page_length, step=500)
+    cfg.crawl_timeout = st.sidebar.slider("Crawl timeout (s)", 5, 120, cfg.crawl_timeout)
+    cfg.max_tool_calls = st.sidebar.slider("Max tool calls", 1, 50, cfg.max_tool_calls)
+    cfg.max_history_turns = st.sidebar.slider("History turns", 1, 20, cfg.max_history_turns)
+    st.session_state.history = deque(st.session_state.history, maxlen=cfg.max_history_turns)
 
-        print(f"\nAssistant:\n{answer}\n")
-        history.append({"user": user, "assistant": answer})
+    st.sidebar.divider()
+    if st.sidebar.button("Clear chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.history.clear()
+        st.session_state.last_tools = []
+        st.rerun()
 
-        if getattr(resp, "tools", None):
-            print("Tools used:", [t.tool_name for t in resp.tools])
-            print()
+    if st.session_state.last_tools:
+        st.sidebar.divider()
+        st.sidebar.caption("Last tools used")
+        for name in st.session_state.last_tools:
+            st.sidebar.write(f"- {name}")
 
 
 def main() -> None:
-    asyncio.run(chat_loop())
+    st.set_page_config(page_title="Local Perplexity App", page_icon="🔎", layout="wide")
+    init_state()
+    render_sidebar()
+
+    st.title("🔎 Local Perplexity-style Assistant")
+    st.caption("Agno + Ollama + SearXNG + Crawl4AI in a Streamlit chat UI")
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    user_text = st.chat_input("Ask anything...")
+    if not user_text:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": user_text})
+    with st.chat_message("user"):
+        st.markdown(user_text)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        with st.spinner("Thinking..."):
+            try:
+                resp = asyncio.run(run_agent(user_text))
+                answer = sanitize_output(resp.content or "")
+                placeholder.markdown(answer)
+                tools_used = [t.tool_name for t in getattr(resp, "tools", [])] if getattr(resp, "tools", None) else []
+                if tools_used:
+                    with st.expander("Tools used"):
+                        st.write(tools_used)
+                st.session_state.last_tools = tools_used
+            except Exception as exc:
+                answer = f"Error from agent: {exc}"
+                placeholder.error(answer)
+                st.session_state.last_tools = []
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.history.append({"user": user_text, "assistant": answer})
 
 
 if __name__ == "__main__":
