@@ -32,6 +32,7 @@ class Config:
     run_timeout: int = 300
     max_history_turns: int = 8
     workspace_dir: Path = Path(".").resolve()
+    uploads_dir: Path = Path(".").resolve() / "uploads"
 
 
 logging.basicConfig(
@@ -58,23 +59,52 @@ def init_state() -> None:
         st.session_state.messages = []
     if "last_tools" not in st.session_state:
         st.session_state.last_tools = []
+    if "uploaded_paths" not in st.session_state:
+        st.session_state.uploaded_paths = []
 
 
-def build_prompt(user_message: str) -> str:
+def save_uploaded_files(files) -> List[Path]:
+    cfg = st.session_state.cfg
+    cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: List[Path] = []
+    for f in files:
+        safe_name = Path(f.name).name
+        target = cfg.uploads_dir / safe_name
+        target.write_bytes(f.getvalue())
+        saved_paths.append(target)
+
+    return saved_paths
+
+
+def build_prompt(user_message: str, attached_paths: List[Path] | None = None) -> str:
     history = st.session_state.history
-    if not history:
-        return user_message
-
     lines: List[str] = []
-    for i, turn in enumerate(history, start=1):
-        lines.append(f"Turn {i} - User: {turn['user']}")
-        lines.append(f"Turn {i} - Assistant: {turn['assistant']}")
 
-    history_block = "\n".join(lines)
+    if history:
+        for i, turn in enumerate(history, start=1):
+            lines.append(f"Turn {i} - User: {turn['user']}")
+            lines.append(f"Turn {i} - Assistant: {turn['assistant']}")
+
+    history_block = "\n".join(lines).strip()
+
+    file_block = ""
+    if attached_paths:
+        file_lines = "\n".join(f"- {p}" for p in attached_paths)
+        file_block = (
+            "\n\nFiles uploaded for this turn:\n"
+            f"{file_lines}\n"
+            "If the user asks about these files, inspect them with FileTools first."
+        )
+
+    if not history_block:
+        return f"{user_message}{file_block}"
+
     return (
         "Use the recent conversation history below to answer the next user message.\n\n"
         f"Recent conversation history:\n{history_block}\n\n"
         f"Current user message:\n{user_message}\n"
+        f"{file_block}"
     )
 
 
@@ -225,6 +255,7 @@ def build_instructions(cfg: Config) -> List[str]:
         "You run locally and have tools.",
         "Use web search (searxng_search) and Crawl4AI for questions requiring current web data.",
         "Use FileTools when the user explicitly mentions reading or writing workspace files.",
+        "If uploaded files are listed in the prompt, inspect those files first before answering.",
         "Use ShellTools only for safe, read-only commands inside the workspace (ls, cat, grep).",
         "Never run destructive shell commands (rm, sudo, chmod -R, kill, etc.).",
         "Keep all file and shell operations inside the workspace directory.",
@@ -270,9 +301,9 @@ def build_agent(cfg: Config) -> Agent:
     )
 
 
-async def run_agent(user_text: str):
+async def run_agent(user_text: str, attached_paths: List[Path] | None = None):
     cfg = st.session_state.cfg
-    prompt = build_prompt(user_text)
+    prompt = build_prompt(user_text, attached_paths=attached_paths)
     agent = build_agent(cfg)
     return await agent.arun(prompt)
 
@@ -323,7 +354,14 @@ def render_sidebar() -> None:
         st.session_state.messages = []
         st.session_state.history.clear()
         st.session_state.last_tools = []
+        st.session_state.uploaded_paths = []
         st.rerun()
+
+    if st.session_state.uploaded_paths:
+        st.sidebar.divider()
+        st.sidebar.caption("Uploaded files")
+        for p in st.session_state.uploaded_paths[-10:]:
+            st.sidebar.write(f"- `{p}`")
 
     if st.session_state.last_tools:
         st.sidebar.divider()
@@ -344,19 +382,36 @@ def main() -> None:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    user_text = st.chat_input("Ask anything...")
-    if not user_text:
+    submission = st.chat_input(
+        "Ask anything or drop files to analyze...",
+        accept_file="multiple",
+        file_type=None,
+    )
+
+    if not submission:
         return
 
-    st.session_state.messages.append({"role": "user", "content": user_text})
+    user_text = submission.text.strip() if submission.text else "Analyze the attached file(s)."
+    uploaded_files = submission.files if hasattr(submission, "files") else []
+
+    saved_paths: List[Path] = []
+    if uploaded_files:
+        saved_paths = save_uploaded_files(uploaded_files)
+        st.session_state.uploaded_paths.extend(saved_paths)
+
+    display_user_text = user_text
+    if saved_paths:
+        display_user_text += "\n\nAttached files:\n" + "\n".join(f"- `{p.name}`" for p in saved_paths)
+
+    st.session_state.messages.append({"role": "user", "content": display_user_text})
     with st.chat_message("user"):
-        st.markdown(user_text)
+        st.markdown(display_user_text)
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
         with st.spinner("Thinking..."):
             try:
-                resp = asyncio.run(run_agent(user_text))
+                resp = asyncio.run(run_agent(user_text, attached_paths=saved_paths))
                 answer = sanitize_output(resp.content or "")
                 placeholder.markdown(answer)
 
@@ -372,7 +427,7 @@ def main() -> None:
                 st.session_state.last_tools = []
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
-    st.session_state.history.append({"user": user_text, "assistant": answer})
+    st.session_state.history.append({"user": display_user_text, "assistant": answer})
 
 
 if __name__ == "__main__":
